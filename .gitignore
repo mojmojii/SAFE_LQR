@@ -1,0 +1,19 @@
+# CLion / JetBrains project state
+.idea/
+
+# CMake build output
+build/
+cmake-build-*/
+
+# Generated binaries and debug artifacts
+*.bin
+*.elf
+*.hex
+*.map
+*.o
+*.obj
+*.d
+
+# OS metadata
+.DS_Store
+Thumbs.db
