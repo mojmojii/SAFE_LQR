@@ -200,7 +200,15 @@ typedef struct {
 } BalState_t;
 
 static BalState_t g = {0};
-static float pin1_k1 = -8.972f;
+typedef enum {
+    K1_PROFILE_RUNTIME = 0,
+    K1_PROFILE_FIXED,
+    K1_PROFILE_ADJUSTABLE
+} K1Profile_t;
+
+static K1Profile_t g_k1_profile = K1_PROFILE_RUNTIME;
+static float g_k1_fixed = K1;
+static float g_k1_adjust_ratio = 0.0f;
 
 // ============================================================================
 //  工具函数
@@ -310,17 +318,21 @@ float balance_control(float x, float dx, float phi, float dphi, float target)
         k4 = (1.0f-a)*g_gain_old.k[3] + a*g_gain_new.k[3];
         tau_ff = (1.0f-a)*g_gain_old.tau_ff + a*g_gain_new.tau_ff; // Kr_hat 同步切换
     }
-    // PIN1 序列 / 可调目标的专用 x 增益逻辑原样保留（pin1_k1 由任务循环维护，
-    // 非特殊模式时任务循环令其跟随 g_gain_cur.k[0]，行为与旧版 K1 一致）
-    float tau_lqr = -(pin1_k1*e1 + k2*e2 + k3*e3 + k4*e4) + tau_ff;
-    (void)k1;
+    // 专用目标模式基于已混合的 k1 计算，避免绕过 50 ms 无扰切换。
+    float effective_k1 = k1;
+    if (g_k1_profile == K1_PROFILE_FIXED) {
+        effective_k1 = g_k1_fixed;
+    } else if (g_k1_profile == K1_PROFILE_ADJUSTABLE) {
+        effective_k1 = k1 + (7.2f - k1) * g_k1_adjust_ratio;
+    }
+    float tau_lqr = -(effective_k1*e1 + k2*e2 + k3*e3 + k4*e4) + tau_ff;
 
     // ---- 5.5 摩擦补偿：卡住给突破脉冲，动起来换动摩擦前馈 ----
     float ae1 = fabsf(e1);
     // 卡住判定：位置偏差>1cm 且球和杆都基本不动（真·被静摩擦卡住）
     uint8_t stuck = (ae1 > 0.01f) && (fabsf(dx) < 0.002f) && (fabsf(g.dphi_f) < 0.1f);
     // 脉冲方向取反馈需求方向（控制器想往哪推就往哪帮），不依赖速度符号
-    float tau_demand = -(pin1_k1 * e1);
+    float tau_demand = -(effective_k1 * e1);
     float tau_fric;
     if (stuck) {
         tau_fric = (tau_demand > 0.0f) ? TAU_KICK : -TAU_KICK;   // 突破脉冲（τ_s×0.9）
@@ -450,7 +462,7 @@ typedef enum
 
 // ============================================================================
 //  任务主循环（老结构：阶跃定点目标）
-//  ※ SAE 改动仅两处：pin1_k1 跟随现役增益；第 3 步前处理待切换增益
+//  ※ SAE 改动仅两处：专用 K1 策略基于混合增益；第 3 步前处理待切换增益
 // ============================================================================
 void StartTask_2(void const *pvParameters)
 {
@@ -530,10 +542,8 @@ void StartTask_2(void const *pvParameters)
 
         control_x = x_m;
         control_dx = dx_m;
-        if (command != LQR_TARGET_PIN1_SEQUENCE)
-        {
-            pin1_k1 = g_gain_cur.k[0];   // SAE：跟随现役增益（默认即出厂 K1，行为同旧版）
-        }
+        g_k1_profile = K1_PROFILE_RUNTIME;
+        g_k1_adjust_ratio = 0.0f;
         switch (command)
         {
             case LQR_TARGET_CENTER:
@@ -548,18 +558,18 @@ void StartTask_2(void const *pvParameters)
             case LQR_TARGET_PIN1_SEQUENCE:
                 if (trajectory_elapsed_ms < 2500U) {
                     target = TARGET_POSITIVE;
-                    pin1_k1 = -7.00f;
+                    g_k1_profile = K1_PROFILE_FIXED;
+                    g_k1_fixed = -7.00f;
                 } else {
                     target = TARGET_NEGATIVE;
-                    pin1_k1 = g_gain_cur.k[0];   // 原 -8.972f，跟随现役增益
                 }
                 break;
             case LQR_TARGET_ADJUSTABLE:
                 target = lqr_adjustable_target;
                 if (target > 0.0f)
                 {
-                    float ratio = clamp(target / 0.125f, 0.0f, 1.0f);
-                    pin1_k1 = g_gain_cur.k[0] + (7.2f - g_gain_cur.k[0]) * ratio;
+                    g_k1_profile = K1_PROFILE_ADJUSTABLE;
+                    g_k1_adjust_ratio = clamp(target / 0.125f, 0.0f, 1.0f);
                 }
                 break;
             case LQR_TARGET_NONE:
