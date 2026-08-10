@@ -342,12 +342,18 @@ def validate_gain_downlink_frame(frame):
     return np.asarray(values[:4]), values[4], values[5], P
 
 def parse_stream(buf):
-    """找帧 [AA 55 T][7×f32][sum] 共32字节；T=0x5A 触发帧，T=0x5C 连续数据流帧。
-    返回 (st, buf, kind)：kind="trigger"/"stream"/None"""
-    while len(buf) >= 32:
+    """Parse telemetry (32 B) and controller status (16 B) frames."""
+    while len(buf) >= 3:
         if buf[0] != 0xAA:
             del buf[0]; continue
         if len(buf) >= 2 and buf[1] != 0x55:
+            del buf[0]; continue
+        if buf[2] == 0x5D:
+            if len(buf) < 16: break
+            if (sum(buf[:15]) & 0xFF) == buf[15]:
+                return struct.unpack("<BBHfI", bytes(buf[3:15])), buf[16:], "status"
+            del buf[0]; continue
+        if buf[2] not in (0x5A, 0x5C):
             del buf[0]; continue
         if len(buf) < 32: break
         if buf[2] in (0x5A, 0x5C) and (sum(buf[:31]) & 0xFF) == buf[31]:
@@ -390,13 +396,50 @@ def run_real_session():
     link_ok = False
     rx_bytes_total = 0
     t_last_hint = time.time()
+    pending_downlink = None
+    pending_sent_at = 0.0
     while True:
         data = ser.read(64)
         if data:
             buf += data
             rx_bytes_total += len(data)
+        if pending_downlink is not None and time.time() - pending_sent_at > 2.0:
+            w.writerow([f"{time.time()-t_start:.3f}", "ack_timeout",
+                        "no MCU status within 2 s; local controller state unchanged"])
+            print("          MCU 状态确认超时，本地现役控制器状态保持不变")
+            pending_downlink = None
         # 链路连通反馈：收到第一个合法触发帧时打印一次
         st, buf, kind = parse_stream(buf)
+        if st is not None and kind == "status":
+            status_code, reason, frame_id, status_fitness, rollback_count = st
+            status_names = {1: "accepted", 2: "rejected", 3: "rollback"}
+            status_name = status_names.get(status_code, f"unknown_{status_code}")
+            detail = (f"frame_id={frame_id};reason={reason};fitness={status_fitness:.6f};"
+                      f"rollbacks={rollback_count}")
+            w.writerow([f"{time.time()-t_start:.3f}", f"mcu_{status_name}", detail])
+            print(f"[{time.time()-t_start:7.2f}s] MCU 状态：{status_name} ({detail})")
+            if pending_downlink is not None and status_code == 1:
+                if not np.isclose(status_fitness, pending_downlink["fitness"],
+                                  rtol=1e-5, atol=1e-7):
+                    w.writerow([f"{time.time()-t_start:.3f}", "unexpected_status",
+                                "accepted status does not match pending fitness"])
+                    log.flush()
+                    continue
+                accepted = pending_downlink
+                globals()["incumbent_chrom"] = accepted["chrom"]
+                K_cur = accepted["K"]
+                P_cur = accepted["P"]
+                J_cur = accepted["fitness"]
+                tau_ff_applied = accepted["tau_ff"]
+                w.writerow([f"{time.time()-t_start:.3f}", "switched",
+                            f"K={np.round(K_cur,4).tolist()};tau_ff={tau_ff_applied:.5f};"
+                            f"fitness={J_cur:.6f};frame_id={frame_id}"])
+                log.flush()
+                pending_downlink = None
+            elif pending_downlink is not None and status_code in (2, 3):
+                pending_downlink = None
+                log.flush()
+            continue
         # 连续数据流帧：只记 CSV（论文主图 x(t) 用），不走触发逻辑
         if st is not None and kind == "stream":
             w.writerow([f"{time.time()-t_start:.3f}", "stream",
@@ -413,6 +456,11 @@ def run_real_session():
             t_last_hint = time.time()
             print("[PC] 10s 未收到任何字节：查 TX/RX 交叉、共地、波特率、固件是否在跑")
         if st is None: continue
+        if pending_downlink is not None:
+            w.writerow([f"{time.time()-t_start:.3f}", "waiting_ack",
+                        "previous downlink has no MCU status yet"])
+            log.flush()
+            continue
         t_now = time.time() - t_start
         print(f"[{t_now:7.2f}s] 收到触发：x={st[0]:+.4f}m target={st[5]:+.4f}m "
               f"xi={st[4]:+.4f} tau={st[6]:+.4f}N·m phi_err={st[2]:+.4f}rad")
@@ -470,14 +518,15 @@ def run_real_session():
         frame = frame_gain_downlink(K_mcu, tau_ff_new, J_downlink, P_new)
         validate_gain_downlink_frame(frame)
         ser.write(frame)
-        globals()["incumbent_chrom"] = chrom.copy()
-        K_cur = K_new
-        P_cur = P_new
-        J_cur = J_downlink
-        tau_ff_applied = tau_ff_new   # 跟踪单片机实际施加值（估计器基准，勿再用 TAU_FF_INC 常量）
-        print(f"          已下发新增益（K_mcu={np.round(K_mcu,3)}，"
-              f"tau_ff={tau_ff_new:+.4f}，fitness={J_downlink:.6f}），种子已更新")
-        w.writerow([f"{t_now:.3f}", "switched",
+        candidate_chrom = (chrom.copy() if trig_count % 3 == 1
+                           else incumbent_chrom.copy())
+        pending_downlink = {"chrom": candidate_chrom, "K": K_new.copy(),
+                            "P": P_new.copy(), "fitness": J_downlink,
+                            "tau_ff": tau_ff_new}
+        pending_sent_at = time.time()
+        print(f"          已发送候选，等待 MCU 状态（K_mcu={np.round(K_mcu,3)}，"
+              f"tau_ff={tau_ff_new:+.4f}，fitness={J_downlink:.6f}）")
+        w.writerow([f"{t_now:.3f}", "sent",
                     f"K={np.round(K_new,4).tolist()};tau_ff={tau_ff_new:.5f};"
                     f"fitness={J_downlink:.6f}"])
         log.flush()

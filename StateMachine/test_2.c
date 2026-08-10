@@ -100,10 +100,19 @@ typedef struct {
 #define FACTORY_MODEL_FITNESS (0.0254812f)
 #define GAIN_FRAME_LEGACY_LEN (24U)
 #define GAIN_FRAME_EXT_LEN (68U)
+#define SAE_STATUS_FRAME_LEN (16U)
+#define SAE_STATUS_FRAME_TYPE (0x5DU)
+#define SAE_STATUS_ACCEPTED (1U)
+#define SAE_STATUS_REJECTED (2U)
+#define SAE_STATUS_ROLLBACK (3U)
+#define SAE_REASON_NONE (0U)
+#define SAE_REASON_INVALID_FRAME (1U)
+#define SAE_REASON_SAFETY_CHECK (2U)
+#define SAE_REASON_BARRIER (3U)
 
 static SafeController_t g_safe_pool[SAFE_POOL_N];
 static uint8_t g_safe_pool_count = 0U;
-static float g_gain_new_fitness = FLT_MAX;
+static float g_gain_new_fitness = NAN;
 // Policy-evaluation Lyapunov matrix for the manually tuned factory gain.
 static float g_p_cur[4][4] = {
     {1148.872706f, 246.428820f, -33.536201f, -0.213145f},
@@ -116,6 +125,14 @@ static float g_p_new[4][4];
 static float g_v_ss = VSS_INITIAL;
 static uint16_t g_periodic_steps = 0U;
 static uint8_t g_pending_pool_admit = 0U;
+static volatile uint8_t g_status_pending = 0U;
+static volatile uint8_t g_status_code = SAE_STATUS_REJECTED;
+static volatile uint8_t g_status_reason = SAE_REASON_NONE;
+static volatile uint16_t g_status_frame_id = 0U;
+static volatile uint16_t g_rx_frame_id = 0U;
+static volatile uint16_t g_gain_new_frame_id = 0U;
+static volatile float g_status_fitness = NAN;
+static uint8_t g_sae_rx_byte = 0U;
 
 static GainSet_t g_gain_cur  = {{K1, K2, K3, K4}, TAU_FF};  // 现役增益（默认=出厂）
 static GainSet_t g_gain_old  = {{K1, K2, K3, K4}, TAU_FF};  // 切换前旧增益（混合用）
@@ -152,7 +169,8 @@ void sae_submit_gain(float k1, float k2, float k3, float k4, float tau_ff)
     }
     GainSet_t gn = {{k1, k2, k3, k4}, tau_ff};
     g_gain_new = gn;
-    g_gain_new_fitness = FLT_MAX;
+    g_gain_new_fitness = NAN;
+    g_gain_new_frame_id = 0U;
     memcpy(g_p_new, g_p_cur, sizeof(g_p_new));
     g_new_pending = 1U;
 }
@@ -164,6 +182,61 @@ void sae_submit_gain(float k1, float k2, float k3, float k4, float tau_ff)
 // ============================================================================
 extern UART_HandleTypeDef huart8;                 // UART8（原陀螺仪串口，已征用为 HIL 链路）
 #define SAE_HUART   huart8
+
+void sae_rx_byte(uint8_t b);
+
+static void sae_queue_status(uint8_t code, uint8_t reason,
+                             uint16_t frame_id, float fitness)
+{
+    g_status_code = code;
+    g_status_reason = reason;
+    g_status_frame_id = frame_id;
+    g_status_fitness = fitness;
+    g_status_pending = 1U;
+}
+
+static void sae_send_status(void)
+{
+    uint8_t buf[SAE_STATUS_FRAME_LEN] = {0U};
+    uint32_t rollback_count = sae_stat_rollbacks;
+    uint16_t frame_id = g_status_frame_id;
+    float fitness = g_status_fitness;
+    buf[0] = 0xAA;
+    buf[1] = 0x55;
+    buf[2] = SAE_STATUS_FRAME_TYPE;
+    buf[3] = g_status_code;
+    buf[4] = g_status_reason;
+    memcpy(&buf[5], &frame_id, sizeof(frame_id));
+    memcpy(&buf[7], &fitness, sizeof(fitness));
+    memcpy(&buf[11], &rollback_count, sizeof(rollback_count));
+    uint8_t sum = 0U;
+    for (uint8_t i = 0U; i < SAE_STATUS_FRAME_LEN - 1U; i++) {
+        sum = (uint8_t)(sum + buf[i]);
+    }
+    buf[SAE_STATUS_FRAME_LEN - 1U] = sum;
+    HAL_UART_Transmit(&SAE_HUART, buf, SAE_STATUS_FRAME_LEN, 5U);
+    g_status_pending = 0U;
+}
+
+static void sae_uart_start(void)
+{
+    (void)HAL_UART_Receive_IT(&SAE_HUART, &g_sae_rx_byte, 1U);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &SAE_HUART) {
+        sae_rx_byte(g_sae_rx_byte);
+        (void)HAL_UART_Receive_IT(&SAE_HUART, &g_sae_rx_byte, 1U);
+    }
+}
+
+void sae_uart_error_recovery(UART_HandleTypeDef *huart)
+{
+    if (huart == &SAE_HUART) {
+        (void)HAL_UART_Receive_IT(&SAE_HUART, &g_sae_rx_byte, 1U);
+    }
+}
 
 // 下行帧：0xA5 legacy=24 B；0xA6 scored controller + fitness + symmetric P=68 B.
 // 在 UART 接收中断/IDLE 回调里对每个字节调用一次
@@ -187,8 +260,11 @@ void sae_rx_byte(uint8_t b) {
         sum = (uint8_t)(sum + buf[i]);
     }
     if (sum != buf[expected_len - 1U]) return;
+    uint16_t rx_frame_id = (uint16_t)(++g_rx_frame_id);
     if (g_blending) {
         sae_stat_rejected++;
+        sae_queue_status(SAE_STATUS_REJECTED, SAE_REASON_SAFETY_CHECK,
+                         rx_frame_id, NAN);
         return;
     }
     memcpy(&g_gain_new, &buf[3], sizeof(GainSet_t));
@@ -204,10 +280,11 @@ void sae_rx_byte(uint8_t b) {
             g_p_new[ci[i]][ri[i]] = p_upper[i];
         }
     } else {
-        g_gain_new_fitness = FLT_MAX;
+        g_gain_new_fitness = NAN;
         memcpy(g_p_new, g_p_cur, sizeof(g_p_new));
     }
-    g_new_pending = 1;                    // 不在中断里切换，交控制循环处理
+    g_gain_new_frame_id = rx_frame_id;
+    g_new_pending = 1U;                   // 不在中断里切换，交控制循环处理
 }
 
 // 上行帧（MCU→PC）：[0xAA][0x55][0x5A][x,dx,phi_err,dphi,xi,target,tau 7×f32][sum] 共 32 字节
@@ -390,6 +467,9 @@ static void gain_rollback(void) {                      // 屏障触发：回滚�
     g_blending = 0;
     g_blend_cnt = 0;
     g_pending_pool_admit = 0U;
+    sae_queue_status(SAE_STATUS_ROLLBACK, SAE_REASON_BARRIER,
+                     g_gain_new_frame_id, g_safe_pool_count > 0U
+                     ? g_safe_pool[0].fitness : NAN);
     sae_stat_rollbacks++;
 }
 
@@ -615,6 +695,7 @@ void StartTask_2(void const *pvParameters)
     DM_MIT_send_qidon(&hcan1,1);
     HAL_Delay(500);
     balance_init();
+    sae_uart_start();
     ball_cascade_pid_init();
 
     while (1)
@@ -764,6 +845,8 @@ void StartTask_2(void const *pvParameters)
             else
             {
                 sae_stat_rejected++;       // 不合格直接丢弃，现役增益继续服役
+                sae_queue_status(SAE_STATUS_REJECTED, SAE_REASON_SAFETY_CHECK,
+                                 g_gain_new_frame_id, g_gain_new_fitness);
             }
         }
         if (g_blending && ++g_blend_cnt >= BLEND_STEPS)
@@ -774,15 +857,20 @@ void StartTask_2(void const *pvParameters)
                 g_gain_cur = g_gain_new;
                 memcpy(g_p_cur, g_p_new, sizeof(g_p_cur));
                 sae_stat_switches++;
+                sae_queue_status(SAE_STATUS_ACCEPTED, SAE_REASON_NONE,
+                                 g_gain_new_frame_id, g_gain_new_fitness);
             }
             else
             {
                 sae_stat_rejected++;
+                sae_queue_status(SAE_STATUS_REJECTED, SAE_REASON_SAFETY_CHECK,
+                                 g_gain_new_frame_id, g_gain_new_fitness);
             }
             g_pending_pool_admit = 0U;
             g_blending = 0U;
             g_blend_cnt = 0U;
         }
+        if (g_status_pending) sae_send_status();
         if (sae_update_request)
         {
             sae_update_request = 0;

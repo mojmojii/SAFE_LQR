@@ -36,6 +36,21 @@ contain safety metadata and are therefore rejected by the scored pool.
 [uint8 additive checksum]           total: 68 bytes
 ```
 
+After a valid candidate is processed, the firmware returns a 16-byte status
+frame so the host does not treat a successful `write()` call as a controller
+switch:
+
+```text
+[AA 55 5D]
+[status reason frame_id]             uint8 uint8 uint16
+[fitness rollback_count]             float32 uint32
+[uint8 additive checksum]            total: 16 bytes
+```
+
+Status values are `1=accepted`, `2=rejected`, and `3=rollback`. The host logs
+`sent` first and records `switched` only after a matching status `accepted` is
+received. UART receive interrupts are restarted after a HAL UART error.
+
 The host obtains `P` from the same continuous-time Riccati solution as the
 candidate gain. The firmware verifies finite gain metadata, positive
 definiteness of `P`, and improvement over the worst member when its five-entry

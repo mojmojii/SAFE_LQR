@@ -257,7 +257,12 @@ void WT901_SetCallback(WT901_Handle_t *handle, WT901_Callback_t callback)
     }
 }
 
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+__weak void sae_uart_error_recovery(UART_HandleTypeDef *huart)
 {
     (void)huart;
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    sae_uart_error_recovery(huart);
 }

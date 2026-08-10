@@ -1,3 +1,4 @@
+import struct
 import unittest
 
 import numpy as np
@@ -60,6 +61,17 @@ class ScoredControllerProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(decoded_ff, sae.TAU_FF_INC, places=6)
         self.assertAlmostEqual(decoded_score, score, places=6)
         np.testing.assert_allclose(decoded_riccati, riccati, rtol=1e-6)
+
+    def test_status_frame_is_parsed_separately_from_telemetry(self):
+        body = bytes([0xAA, 0x55, 0x5D]) + struct.pack(
+            "<BBHfI", 1, 0, 7, 0.125, 2)
+        frame = body + bytes([sum(body) & 0xFF])
+        status, rest, kind = sae.parse_stream(bytearray(frame))
+        self.assertEqual(kind, "status")
+        self.assertEqual(rest, bytearray())
+        self.assertEqual(status[:3], (1, 0, 7))
+        self.assertAlmostEqual(status[3], 0.125, places=6)
+        self.assertEqual(status[4], 2)
 
 
 if __name__ == "__main__":
