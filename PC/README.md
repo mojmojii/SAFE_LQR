@@ -102,6 +102,7 @@ python -m unittest PC.test_eaga
 ```
 
 The tests verify the two-subpopulation layout, elite-archive capacity and
-ordering, monotonically rank-scaled diffusion, finite optimizer output, and a
+ordering, monotonically rank-scaled diffusion, finite optimizer output, a
 68-byte scored-controller frame round trip including checksum and symmetric
-Riccati-matrix reconstruction.
+Riccati-matrix reconstruction, and separate parsing of the 16-byte MCU status
+frame.
