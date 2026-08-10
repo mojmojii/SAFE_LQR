@@ -80,8 +80,18 @@ Then run:
 python .\PC\sae_pc_hil.py
 ```
 
-For hardware use, configure `COM_PORT` first. Keep `ALLOW_DOWNLINK = False`
-until the model, gain signs, limits, and firmware protocol have been verified.
+For hardware use, configure `COM_PORT` first. The default is observation-only
+(`SAE_ALLOW_DOWNLINK` unset or `0`). After the model, gain signs, limits, and
+firmware protocol have been verified, enable the frozen experiment configuration
+explicitly without editing source code:
+
+```powershell
+$env:SAE_ALLOW_DOWNLINK = "1"
+python .\PC\sae_pc_hil.py
+```
+
+Record the command and commit hash with the experiment log. Unset the variable
+or set it to `0` to return to observation-only mode.
 
 ## Test
 

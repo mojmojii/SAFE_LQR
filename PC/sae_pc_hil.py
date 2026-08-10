@@ -11,7 +11,7 @@ sae_pc_hil.py — SAE-EAGA-LQR 上位机（PC 端）
   MODE = "real"     实物模式：连真实串口，等单片机触发帧，重优化后回传新增益
 """
 
-import sys, time, struct, csv
+import os, sys, time, struct, csv
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from scipy.linalg import solve_continuous_are
@@ -133,6 +133,10 @@ ALLOW_DOWNLINK = False# 【S3 实验开闸】符号约定已验证、观察模�
 
 # PC→固件符号映射（曲柄连杆 θ 与编码器 φ 反向：固件 K1 负、K3 正）
 # 未经 MATLAB 模型核对前不要用；核对后把下行帧里的 K 换成 map_gain_to_mcu(K)
+ALLOW_DOWNLINK = os.environ.get("SAE_ALLOW_DOWNLINK", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}  # Default observation mode; enable explicitly for frozen experiments.
+
 def map_gain_to_mcu(K):
     return K.copy()   # 2026-08-07 模型已按曲柄连杆机构对齐，PC 增益即固件约定，恒等
 
