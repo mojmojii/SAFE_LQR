@@ -12,6 +12,7 @@ sae_pc_hil.py — SAE-EAGA-LQR 上位机（PC 端）
 """
 
 import sys, time, struct, csv
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from scipy.linalg import solve_continuous_are
 
@@ -48,6 +49,13 @@ ERR_THR      = 0.002         # 触发阈值 2mm（固件 ERR_TRIG 同步改成 0
 EA_POP       = 20            # 2 子群 × 10
 EA_GEN       = 12
 WARM_SPREAD  = 0.15          # 15% 邻域扰动
+EA_SUBPOPS   = 2
+EA_ARCHIVE_SIZE = 6
+EA_ARCHIVE_GUIDES = 3
+EA_SIGMA_BASE = 0.05 * WARM_SPREAD
+EA_DIFFUSION_ALPHA = 5.0
+EA_ARCHIVE_BETA = 0.35
+EA_BOUND_RADIUS = 0.75       # 每个 log10 权重围绕现役解的有界搜索半径
 
 LOG_CSV      = "sae_hil_log.csv"
 
@@ -161,34 +169,120 @@ def fitness(chrom):
 # ============================================================================
 #  暖启动 EAGA（小预算在线版）
 # ============================================================================
-print("[PC] 版本标记 v8：20Hz 连续数据流记录（论文主图 x(t)）+ 清积压帧 + 信任域——看到这行才是新脚本")
+print("[PC] 版本标记 v9：双子群 EAGA + 排名扩散 + 精英档案引导交叉")
 incumbent_chrom = CHROM_INCUMBENT.copy()
 
-def eaga_online():
+def rank_diffusion_sigma(rank, population_size=EA_POP):
+    """Rank-dependent diffusion used by the manuscript's EAGA definition."""
+    return EA_SIGMA_BASE * (1.0 + EA_DIFFUSION_ALPHA * rank / population_size)
+
+
+def _evaluate_subpopulation(population):
+    scores = np.zeros(len(population))
+    gains = [None] * len(population)
+    for i, chromosome in enumerate(population):
+        scores[i], gains[i] = fitness(chromosome)
+    return scores, gains
+
+
+def _update_elite_archive(archive, chromosomes, scores, gains):
+    candidates = list(archive)
+    for chromosome, score, gain in zip(chromosomes, scores, gains):
+        if gain is not None and np.isfinite(score):
+            candidates.append((float(score), chromosome.copy(), np.asarray(gain).copy()))
+    candidates.sort(key=lambda item: item[0])
+
+    unique = []
+    for candidate in candidates:
+        if not any(np.allclose(candidate[1], saved[1], rtol=0.0, atol=1e-12)
+                   for saved in unique):
+            unique.append(candidate)
+        if len(unique) == EA_ARCHIVE_SIZE:
+            break
+    return unique
+
+
+def _tournament_index(scores):
+    a, b = np.random.randint(0, len(scores), 2)
+    return a if scores[a] < scores[b] else b
+
+
+def _evolve_subpopulation(population, scores, global_ranks, archive,
+                          lower_bound, upper_bound):
+    best_index = int(np.argmin(scores))
+    next_population = [population[best_index].copy()]
+
+    while len(next_population) < len(population):
+        parent_index = _tournament_index(scores)
+        parent = population[parent_index]
+        guide_count = min(EA_ARCHIVE_GUIDES, len(archive))
+        guide = archive[np.random.randint(guide_count)][1]
+        sigma = rank_diffusion_sigma(int(global_ranks[parent_index]))
+        child = (parent
+                 + EA_ARCHIVE_BETA * (guide - parent)
+                 + np.random.normal(0.0, sigma, size=parent.shape))
+        next_population.append(np.clip(child, lower_bound, upper_bound))
+
+    return np.asarray(next_population)
+
+
+def eaga_online(return_diagnostics=False):
+    """Warm-started EAGA with two subpopulations and a shared elite archive."""
     global incumbent_chrom
+    if EA_POP % EA_SUBPOPS != 0:
+        raise ValueError("EA_POP must be divisible by EA_SUBPOPS")
+
     t0 = time.time()
-    pop = incumbent_chrom + np.random.uniform(-WARM_SPREAD, WARM_SPREAD, (EA_POP, 5))
-    pop[0] = incumbent_chrom                     # 现役染色体直接入种群（暖启动核心）
-    elite = incumbent_chrom.copy(); elite_J = np.inf; elite_K = None
+    subpopulation_size = EA_POP // EA_SUBPOPS
+    population_shape = (EA_SUBPOPS, subpopulation_size, incumbent_chrom.size)
+    subpopulations = incumbent_chrom + np.random.uniform(
+        -WARM_SPREAD, WARM_SPREAD, population_shape)
+    subpopulations[:, 0, :] = incumbent_chrom
+    lower_bound = incumbent_chrom - EA_BOUND_RADIUS
+    upper_bound = incumbent_chrom + EA_BOUND_RADIUS
+    archive = []
+
     for _ in range(EA_GEN):
-        Js = np.zeros(EA_POP); Ks = [None]*EA_POP
-        for i in range(EA_POP):
-            Js[i], Ks[i] = fitness(pop[i])
-        rank = np.argsort(Js)
-        if Js[rank[0]] < elite_J:
-            elite_J = Js[rank[0]]; elite = pop[rank[0]].copy(); elite_K = Ks[rank[0]]
-        new = [pop[rank[0]].copy(), pop[rank[1]].copy()]
-        while len(new) < EA_POP:
-            a, b = np.random.randint(0, EA_POP, 2)
-            p1 = pop[a] if Js[a] < Js[b] else pop[b]
-            a, b = np.random.randint(0, EA_POP, 2)
-            p2 = pop[a] if Js[a] < Js[b] else pop[b]
-            child = np.where(np.random.rand(5) < 0.5, p1, p2)
-            child += np.random.randn(5) * (0.05 + 0.25*np.random.rand()) * WARM_SPREAD
-            new.append(child)
-        pop = np.array(new)
-    ms = (time.time()-t0)*1000
-    return elite, elite_K, elite_J, ms
+        with ThreadPoolExecutor(max_workers=EA_SUBPOPS) as executor:
+            evaluated = list(executor.map(_evaluate_subpopulation, subpopulations))
+
+        score_matrix = np.asarray([item[0] for item in evaluated])
+        gain_matrix = [item[1] for item in evaluated]
+        flat_population = subpopulations.reshape(EA_POP, -1)
+        flat_scores = score_matrix.reshape(EA_POP)
+        flat_gains = [gain for subpop_gains in gain_matrix for gain in subpop_gains]
+        archive = _update_elite_archive(
+            archive, flat_population, flat_scores, flat_gains)
+        if not archive:
+            raise RuntimeError("EAGA found no feasible candidate")
+
+        rank_order = np.argsort(flat_scores)
+        global_ranks = np.empty(EA_POP, dtype=int)
+        global_ranks[rank_order] = np.arange(EA_POP)
+        rank_matrix = global_ranks.reshape(EA_SUBPOPS, subpopulation_size)
+
+        subpopulations = np.asarray([
+            _evolve_subpopulation(
+                subpopulations[i], score_matrix[i], rank_matrix[i], archive,
+                lower_bound, upper_bound)
+            for i in range(EA_SUBPOPS)
+        ])
+
+    elite_J, elite, elite_K = archive[0]
+    ms = (time.time() - t0) * 1000
+    result = (elite, elite_K, elite_J, ms)
+    if not return_diagnostics:
+        return result
+
+    diagnostics = {
+        "subpopulation_count": EA_SUBPOPS,
+        "population_shape": population_shape,
+        "archive_size": len(archive),
+        "archive_scores": [item[0] for item in archive],
+        "sigma_best": rank_diffusion_sigma(0),
+        "sigma_worst": rank_diffusion_sigma(EA_POP - 1),
+    }
+    return result + (diagnostics,)
 
 def estimate_tau_ff(K_cur, e_ss, tau_ff_c, xi=0.0):
     """certainty-equivalence 前馈更新（v2，扣除积分在扛的部分）：

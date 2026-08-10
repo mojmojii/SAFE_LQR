@@ -17,3 +17,9 @@ cmake-build-*/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Python caches and generated experiment artifacts
+__pycache__/
+*.py[cod]
+sae_*_log.csv
+sae_selftest.png
