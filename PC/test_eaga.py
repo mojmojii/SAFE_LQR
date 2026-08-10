@@ -45,5 +45,22 @@ class EagaStructureTests(unittest.TestCase):
         self.assertTrue(np.isfinite(score))
 
 
+class ScoredControllerProtocolTests(unittest.TestCase):
+    def test_extended_frame_round_trip(self):
+        gain, riccati = sae.riccati_from_chrom(sae.CHROM_INCUMBENT)
+        score = sae.controller_fitness(gain, sae.TAU_FF_INC)
+        frame = sae.frame_gain_downlink(gain, sae.TAU_FF_INC, score, riccati)
+
+        decoded_gain, decoded_ff, decoded_score, decoded_riccati = (
+            sae.validate_gain_downlink_frame(frame))
+
+        self.assertEqual(len(frame), 68)
+        self.assertEqual(frame[:3], bytes([0xAA, 0x55, 0xA6]))
+        np.testing.assert_allclose(decoded_gain, gain, rtol=1e-6)
+        self.assertAlmostEqual(decoded_ff, sae.TAU_FF_INC, places=6)
+        self.assertAlmostEqual(decoded_score, score, places=6)
+        np.testing.assert_allclose(decoded_riccati, riccati, rtol=1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()

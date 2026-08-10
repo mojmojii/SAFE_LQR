@@ -83,12 +83,17 @@ def plant_AB(J=J_EQ, b=B_EQ, K0=K0_TR, m_b=M_BALL):
     B = np.array([[0], [0], [0], [1/J]], float)
     return A, B
 
-def lqr_from_chrom(chrom):
+def riccati_from_chrom(chrom):
     q = 10.0**chrom[:4]
     r = 10.0**chrom[4]
     A, B = plant_AB()
     P = solve_continuous_are(A, B, np.diag(q), np.array([[r]]))
-    return np.linalg.solve(np.array([[r]]), B.T @ P)[0]   # (4,)
+    K = np.linalg.solve(np.array([[r]]), B.T @ P)[0]
+    return K, P
+
+
+def lqr_from_chrom(chrom):
+    return riccati_from_chrom(chrom)[0]
 
 def closed_loop_stable(K):
     A, B = plant_AB()
@@ -153,6 +158,12 @@ def simulate(K, tau_ff_ctrl, plant_tau_ff_true, T=5.0, dt=0.001, x0=None):
     trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return t, X, U, sat/n, float(trapz(np.abs(X[:,0]-TARGET), t))
 
+def controller_fitness(K, tau_ff_ctrl):
+    _, _, _, sat, iae = simulate(
+        K, tau_ff_ctrl, TAU_FF_INC*(1+MISMATCH_S3), T=3.0, dt=0.002)
+    return float(iae + 50*sat)
+
+
 def fitness(chrom):
     try:
         K = lqr_from_chrom(chrom)
@@ -163,8 +174,7 @@ def fitness(chrom):
     ok, _ = safety_precheck(K, TAU_FF_INC)
     if not ok:
         return 1e5, None
-    _, _, _, sat, iae = simulate(K, TAU_FF_INC, TAU_FF_INC*(1+MISMATCH_S3), T=3.0, dt=0.002)
-    return iae + 50*sat, K
+    return controller_fitness(K, TAU_FF_INC), K
 
 # ============================================================================
 #  暖启动 EAGA（小预算在线版）
@@ -297,11 +307,39 @@ def estimate_tau_ff(K_cur, e_ss, tau_ff_c, xi=0.0):
 # ============================================================================
 #  帧协议（与固件严格一致）
 # ============================================================================
-def frame_gain_downlink(K, tau_ff):
-    """PC→MCU：[AA 55 A5][k1..k4,tau_ff 5×f32][sum] 共24字节"""
-    payload = struct.pack("<5f", K[0], K[1], K[2], K[3], tau_ff)
-    body = bytes([0xAA, 0x55, 0xA5]) + payload
+def frame_gain_downlink(K, tau_ff, fitness_value, P):
+    """Build the 68-byte scored-controller frame used by the safety pool."""
+    K = np.asarray(K, dtype=float).reshape(4)
+    P = np.asarray(P, dtype=float).reshape(4, 4)
+    if not np.all(np.isfinite(K)) or not np.isfinite(tau_ff):
+        raise ValueError("gain payload contains non-finite values")
+    if not np.isfinite(fitness_value) or not np.all(np.isfinite(P)):
+        raise ValueError("safety metadata contains non-finite values")
+    if not np.allclose(P, P.T, rtol=0.0, atol=1e-5):
+        raise ValueError("Riccati matrix must be symmetric")
+    p_upper = P[np.triu_indices(4)]
+    payload = struct.pack(
+        "<16f", K[0], K[1], K[2], K[3], tau_ff, fitness_value, *p_upper)
+    body = bytes([0xAA, 0x55, 0xA6]) + payload
     return body + bytes([sum(body) & 0xFF])
+
+
+def validate_gain_downlink_frame(frame):
+    """Offline protocol check; this function never opens a serial port."""
+    if len(frame) != 68:
+        raise ValueError(f"expected 68 bytes, got {len(frame)}")
+    if frame[:3] != bytes([0xAA, 0x55, 0xA6]):
+        raise ValueError("invalid scored-controller frame header")
+    if (sum(frame[:-1]) & 0xFF) != frame[-1]:
+        raise ValueError("invalid scored-controller checksum")
+    values = struct.unpack("<16f", frame[3:-1])
+    P = np.zeros((4, 4), dtype=float)
+    upper = np.triu_indices(4)
+    P[upper] = values[6:]
+    P[(upper[1], upper[0])] = values[6:]
+    if not np.allclose(P, P.T, rtol=0.0, atol=1e-7):
+        raise ValueError("decoded Riccati matrix is not symmetric")
+    return np.asarray(values[:4]), values[4], values[5], P
 
 def parse_stream(buf):
     """找帧 [AA 55 T][7×f32][sum] 共32字节；T=0x5A 触发帧，T=0x5C 连续数据流帧。
@@ -345,7 +383,8 @@ def run_real_session():
     w = csv.writer(log); w.writerow(["time_s", "event", "detail"])
     t_start = time.time()
     buf = bytearray()
-    K_cur = K_FACTORY.copy()          # 显示用；实际增益在单片机里
+    K_cur, P_cur = riccati_from_chrom(CHROM_INCUMBENT)
+    J_cur = controller_fitness(K_cur, TAU_FF_INC)
     tau_ff_applied = TAU_FF_INC       # 单片机当前实际施加的前馈（每次下发后跟踪更新）
     trig_count = 0                    # 触发计数：每 3 次才重优化，其余复用 K（PC 降频时保住 march 节奏）
     link_ok = False
@@ -390,12 +429,15 @@ def run_real_session():
         trig_count += 1
         if trig_count % 3 == 1:   # 第 1、4、7… 次触发重优化
             chrom, K_new, J, ms = eaga_online()
+            K_new, P_new = riccati_from_chrom(chrom)
             print(f"          重优化完成：J={J:.4f}，耗时 {ms:.0f}ms，K={np.round(K_new,3)}")
             # 优化期间（PC 降频可达 15s+）串口积压的触发帧全是过期状态，
             # 不丢会被当成新帧连续处理 → ff 基于陈旧偏差过冲（2026-08-07 深夜实测）
             ser.reset_input_buffer(); buf = bytearray()
         else:
             K_new = K_cur
+            P_new = P_cur
+            J = J_cur
             print(f"          复用现役增益 K={np.round(K_new,3)}（下次触发重优化），仅做 ff 修正")
         # 2) certainty-equivalence 前馈更新（用上报的 target 和 xi）
         e_ss = st[0] - st[5]
@@ -408,6 +450,7 @@ def run_real_session():
         # 全幅修正(步长~0.1>噪声带)必然在估计器-摩擦间形成极限环，实测 tau_ff ±0.09 往复振荡；
         # 小步逼近，错也错在摩擦带内，推不动球，随机游走有界）
         tau_ff_new = tau_ff_applied + float(np.clip(tau_ff_est - tau_ff_applied, -0.02, 0.02))
+        J_downlink = controller_fitness(K_new, tau_ff_new)
         # 3) 安全检查
         ok, why = safety_precheck(K_new, tau_ff_new)
         if not ok:
@@ -419,17 +462,24 @@ def run_real_session():
             print(f"          [观察模式] 检查通过但未下发（ALLOW_DOWNLINK=False）。"
                   f"映射后增益 K_mcu={np.round(map_gain_to_mcu(K_new),3)}")
             w.writerow([f"{t_now:.3f}", "monitor_only",
-                        f"K_mcu={np.round(map_gain_to_mcu(K_new),4).tolist()};tau_ff={tau_ff_new:.5f}"])
+                        f"K_mcu={np.round(map_gain_to_mcu(K_new),4).tolist()};"
+                        f"tau_ff={tau_ff_new:.5f};fitness={J_downlink:.6f}"])
             log.flush()
             continue
         K_mcu = map_gain_to_mcu(K_new)
-        ser.write(frame_gain_downlink(K_mcu, tau_ff_new))
+        frame = frame_gain_downlink(K_mcu, tau_ff_new, J_downlink, P_new)
+        validate_gain_downlink_frame(frame)
+        ser.write(frame)
         globals()["incumbent_chrom"] = chrom.copy()
         K_cur = K_new
+        P_cur = P_new
+        J_cur = J_downlink
         tau_ff_applied = tau_ff_new   # 跟踪单片机实际施加值（估计器基准，勿再用 TAU_FF_INC 常量）
-        print(f"          已下发新增益（K_mcu={np.round(K_mcu,3)}，tau_ff={tau_ff_new:+.4f}），种子已更新")
+        print(f"          已下发新增益（K_mcu={np.round(K_mcu,3)}，"
+              f"tau_ff={tau_ff_new:+.4f}，fitness={J_downlink:.6f}），种子已更新")
         w.writerow([f"{t_now:.3f}", "switched",
-                    f"K={np.round(K_new,4).tolist()};tau_ff={tau_ff_new:.5f}"])
+                    f"K={np.round(K_new,4).tolist()};tau_ff={tau_ff_new:.5f};"
+                    f"fitness={J_downlink:.6f}"])
         log.flush()
 
 # ============================================================================

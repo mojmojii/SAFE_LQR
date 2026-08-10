@@ -21,6 +21,30 @@ Candidate fitness remains the model-rollout IAE plus the saturation penalty,
 and every returned gain must pass the existing stability and safety checks.
 The two subpopulations are evaluated concurrently with two host threads.
 
+## Safety-supervision downlink
+
+Accepted candidates use the scored-controller frame below. The firmware keeps
+the legacy `0xA5` parser for monitoring compatibility, but legacy frames do not
+contain safety metadata and are therefore rejected by the scored pool.
+
+```text
+[AA 55 A6]
+[k1 k2 k3 k4 tau_ff]                 5 x float32
+[fitness]                            1 x float32
+[P00 P01 P02 P03 P11 P12 P13
+ P22 P23 P33]                       10 x float32
+[uint8 additive checksum]           total: 68 bytes
+```
+
+The host obtains `P` from the same continuous-time Riccati solution as the
+candidate gain. The firmware verifies finite gain metadata, positive
+definiteness of `P`, and improvement over the worst member when its five-entry
+fitness-ranked safe-controller pool is full. It then performs a 50 ms linear
+transition across all four feedback gains and `tau_ff`; a
+`V(x) > 1.5 V_ss` violation rolls back to the best stored controller. Feedback
+action is temporarily multiplied by `0.9` when the raw command exceeds 80% of
+the actuator limit.
+
 ## Requirements
 
 ```powershell
@@ -53,4 +77,6 @@ python -m unittest PC.test_eaga
 ```
 
 The tests verify the two-subpopulation layout, elite-archive capacity and
-ordering, monotonically rank-scaled diffusion, and finite optimizer output.
+ordering, monotonically rank-scaled diffusion, finite optimizer output, and a
+68-byte scored-controller frame round trip including checksum and symmetric
+Riccati-matrix reconstruction.

@@ -4,6 +4,7 @@
 #include "bsp_can.h"
 #include "struct_typedef.h"
 #include "cmsis_os.h"
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -79,25 +80,50 @@
 // ============================================================================
 #define BLEND_STEPS     (50U)      // 无扰切换：50ms 线性混合（1kHz 下 50 步）
 #define SAFE_POOL_N     (5U)       // 安全池容量 N_safe = 5
-#define ERR_WIN         (500U)     // 滑窗 500ms：检测稳态偏置
 #define ERR_TRIG        (0.004f)   // 触发阈值：窗内 mean|e1| > 4mm（S3 实验：错开 5mm 积分死区，避免死区抖动反复点火；平时可改回 0.002f）
 #define COOLDOWN_STEPS  (3000U)    // 触发冷却 3s，防频繁重优化
-#define BARRIER_V_MAX   (0.06f)    // Lyapunov 屏障：二次状态范数上限（切换期间监控）
 
 typedef struct { float k[4]; float tau_ff; } GainSet_t;
+
+typedef struct {
+    GainSet_t gain;
+    float fitness;
+    float p[4][4];
+    uint8_t valid;
+} SafeController_t;
+
+#define UPDATE_PERIOD_STEPS (500U)
+#define VSS_INITIAL (0.04f)
+#define VSS_FLOOR (1.0e-4f)
+#define VSS_ALPHA (0.01f)
+#define RUNTIME_GAIN_SCALE (0.9f)
+#define FACTORY_MODEL_FITNESS (0.0254812f)
+#define GAIN_FRAME_LEGACY_LEN (24U)
+#define GAIN_FRAME_EXT_LEN (68U)
+
+static SafeController_t g_safe_pool[SAFE_POOL_N];
+static uint8_t g_safe_pool_count = 0U;
+static float g_gain_new_fitness = FLT_MAX;
+// Policy-evaluation Lyapunov matrix for the manually tuned factory gain.
+static float g_p_cur[4][4] = {
+    {1148.872706f, 246.428820f, -33.536201f, -0.213145f},
+    {246.428820f, 80.026878f, -14.929501f, -0.244699f},
+    {-33.536201f, -14.929501f, 3.975809f, 0.069808f},
+    {-0.213145f, -0.244699f, 0.069808f, 0.006560f}
+};
+static float g_p_old[4][4];
+static float g_p_new[4][4];
+static float g_v_ss = VSS_INITIAL;
+static uint16_t g_periodic_steps = 0U;
+static uint8_t g_pending_pool_admit = 0U;
 
 static GainSet_t g_gain_cur  = {{K1, K2, K3, K4}, TAU_FF};  // 现役增益（默认=出厂）
 static GainSet_t g_gain_old  = {{K1, K2, K3, K4}, TAU_FF};  // 切换前旧增益（混合用）
 static GainSet_t g_gain_new  = {{0}};                        // 待切换增益（外部写入）
-static GainSet_t g_pool[SAFE_POOL_N];                        // 安全池（环形缓冲）
-static uint8_t  g_pool_top    = 0;
-static uint8_t  g_new_pending = 0;    // 有待切换增益，控制循环验证后混合
-static uint8_t  g_blending    = 0;    // 1 = 正在 50ms 混合
+static volatile uint8_t g_new_pending = 0;    // 有待切换增益，控制循环验证后混合
+static volatile uint8_t g_blending    = 0;    // 1 = 正在 50ms 混合
 static uint16_t g_blend_cnt   = 0;
 static uint16_t g_cooldown    = 0;
-static float    g_err_acc     = 0;
-volatile uint8_t g_traj_moving = 0;   // 【轨迹实验】目标过渡段=1：暂停触发积累（稳态假设只在停留段成立）
-static uint16_t g_err_cnt     = 0;
 volatile uint8_t sae_update_request = 0;   // 触发标志：调试器/OLED 可读，外部置 0 清除
 
 // ============================================================================
@@ -120,9 +146,15 @@ volatile uint32_t sae_stat_switches  = 0;   // 成功切换次数
 // ============================================================================
 void sae_submit_gain(float k1, float k2, float k3, float k4, float tau_ff)
 {
+    if (g_blending) {
+        sae_stat_rejected++;
+        return;
+    }
     GainSet_t gn = {{k1, k2, k3, k4}, tau_ff};
-    g_gain_new   = gn;
-    g_new_pending = 1;
+    g_gain_new = gn;
+    g_gain_new_fitness = FLT_MAX;
+    memcpy(g_p_new, g_p_cur, sizeof(g_p_new));
+    g_new_pending = 1U;
 }
 
 // ============================================================================
@@ -133,21 +165,48 @@ void sae_submit_gain(float k1, float k2, float k3, float k4, float tau_ff)
 extern UART_HandleTypeDef huart8;                 // UART8（原陀螺仪串口，已征用为 HIL 链路）
 #define SAE_HUART   huart8
 
-// 下行帧解析（PC→MCU）：[0xAA][0x55][0xA5][k1..k4,tau_ff 5×f32][sum] 共 24 字节
+// 下行帧：0xA5 legacy=24 B；0xA6 scored controller + fitness + symmetric P=68 B.
 // 在 UART 接收中断/IDLE 回调里对每个字节调用一次
 void sae_rx_byte(uint8_t b) {
-    static uint8_t buf[24];
-    static uint8_t idx = 0;
+    static uint8_t buf[GAIN_FRAME_EXT_LEN];
+    static uint8_t idx = 0U;
+    static uint8_t expected_len = 0U;
     if (idx == 0 && b != 0xAA) return;
-    if (idx == 1 && b != 0x55) { idx = (b == 0xAA) ? 1U : 0U; return; }
+    if (idx == 1U && b != 0x55) { idx = (b == 0xAA) ? 1U : 0U; return; }
     buf[idx] = b;
-    if (++idx < 24U) return;
-    idx = 0;
-    if (buf[2] != 0xA5) return;
-    uint8_t sum = 0;
-    for (int i = 0; i < 23; i++) sum = (uint8_t)(sum + buf[i]);
-    if (sum != buf[23]) return;
+    if (idx == 2U) {
+        if (b == 0xA5) expected_len = GAIN_FRAME_LEGACY_LEN;
+        else if (b == 0xA6) expected_len = GAIN_FRAME_EXT_LEN;
+        else { idx = 0U; expected_len = 0U; return; }
+    }
+    idx++;
+    if (expected_len == 0U || idx < expected_len) return;
+    idx = 0U;
+    uint8_t sum = 0U;
+    for (uint8_t i = 0U; i < (uint8_t)(expected_len - 1U); i++) {
+        sum = (uint8_t)(sum + buf[i]);
+    }
+    if (sum != buf[expected_len - 1U]) return;
+    if (g_blending) {
+        sae_stat_rejected++;
+        return;
+    }
     memcpy(&g_gain_new, &buf[3], sizeof(GainSet_t));
+    if (buf[2] == 0xA6) {
+        memcpy(&g_gain_new_fitness, &buf[23], sizeof(float));
+        float p_upper[10];
+        memcpy(p_upper, &buf[27], sizeof(p_upper));
+        memset(g_p_new, 0, sizeof(g_p_new));
+        const uint8_t ri[10] = {0,0,0,0,1,1,1,2,2,3};
+        const uint8_t ci[10] = {0,1,2,3,1,2,3,2,3,3};
+        for (uint8_t i = 0U; i < 10U; i++) {
+            g_p_new[ri[i]][ci[i]] = p_upper[i];
+            g_p_new[ci[i]][ri[i]] = p_upper[i];
+        }
+    } else {
+        g_gain_new_fitness = FLT_MAX;
+        memcpy(g_p_new, g_p_cur, sizeof(g_p_new));
+    }
     g_new_pending = 1;                    // 不在中断里切换，交控制循环处理
 }
 
@@ -255,21 +314,82 @@ static uint8_t gain_sane(const GainSet_t *gn) {
         if (!isfinite(gn->k[i]) || fabsf(gn->k[i]) > 500.0f) return 0;
     }
     if (!isfinite(gn->tau_ff) || fabsf(gn->tau_ff) > 0.3f) return 0;
-    // 5cm 满偏时位置项峰值力矩粗估，超 80% 额定直接拒收（论文 80% 饱和预测门槛）
-    if (fabsf(gn->k[0]) * 0.05f + fabsf(gn->tau_ff) > 0.8f * TAU_MAX) return 0;
+    // Match the host pre-check's 3 cm candidate-evaluation envelope.
+    if (fabsf(gn->k[0]) * 0.03f + fabsf(gn->tau_ff) > 0.8f * TAU_MAX) return 0;
     return 1;
 }
 
-static void pool_push(const GainSet_t *gs) {           // 现役增益入安全池
-    g_pool[g_pool_top] = *gs;
-    g_pool_top = (uint8_t)((g_pool_top + 1U) % SAFE_POOL_N);
+static uint8_t matrix_spd4(const float p[4][4])
+{
+    float l[4][4] = {{0.0f}};
+    for (uint8_t i = 0U; i < 4U; i++) {
+        for (uint8_t j = 0U; j <= i; j++) {
+            float s = p[i][j];
+            for (uint8_t k = 0U; k < j; k++) s -= l[i][k] * l[j][k];
+            if (i == j) {
+                if (!isfinite(s) || s <= 1.0e-6f) return 0U;
+                l[i][j] = sqrtf(s);
+            } else {
+                l[i][j] = s / l[j][j];
+            }
+        }
+    }
+    return 1U;
+}
+
+static uint8_t safe_pool_can_admit(float fitness)
+{
+    if (!isfinite(fitness)) return 0U;
+    if (g_safe_pool_count < SAFE_POOL_N) return 1U;
+    return fitness < g_safe_pool[g_safe_pool_count - 1U].fitness;
+}
+
+static uint8_t safe_pool_admit(const GainSet_t *gain, float fitness,
+                              const float p[4][4])
+{
+    if (!safe_pool_can_admit(fitness) || !matrix_spd4(p)) return 0U;
+    uint8_t pos = 0U;
+    while (pos < g_safe_pool_count && g_safe_pool[pos].fitness <= fitness) pos++;
+    uint8_t new_count = (g_safe_pool_count < SAFE_POOL_N)
+                      ? (uint8_t)(g_safe_pool_count + 1U) : SAFE_POOL_N;
+    for (uint8_t i = new_count - 1U; i > pos; i--) {
+        g_safe_pool[i] = g_safe_pool[i - 1U];
+    }
+    g_safe_pool[pos].gain = *gain;
+    g_safe_pool[pos].fitness = fitness;
+    memcpy(g_safe_pool[pos].p, p, sizeof(g_safe_pool[pos].p));
+    g_safe_pool[pos].valid = 1U;
+    g_safe_pool_count = new_count;
+    return 1U;
+}
+
+static float lyapunov_value(float e1, float e2, float e3, float e4)
+{
+    const float x[4] = {e1, e2, e3, e4};
+    float p[4][4];
+    float a = g_blending ? ((float)g_blend_cnt / (float)BLEND_STEPS) : 0.0f;
+    for (uint8_t i = 0U; i < 4U; i++) {
+        for (uint8_t j = 0U; j < 4U; j++) {
+            p[i][j] = g_blending
+                    ? (1.0f-a)*g_p_old[i][j] + a*g_p_new[i][j]
+                    : g_p_cur[i][j];
+        }
+    }
+    float v = 0.0f;
+    for (uint8_t i = 0U; i < 4U; i++) {
+        for (uint8_t j = 0U; j < 4U; j++) v += x[i] * p[i][j] * x[j];
+    }
+    return v;
 }
 
 static void gain_rollback(void) {                      // 屏障触发：回滚最近安全增益
-    g_pool_top = (uint8_t)((g_pool_top + SAFE_POOL_N - 1U) % SAFE_POOL_N);
-    g_gain_cur = g_pool[g_pool_top];
+    if (g_safe_pool_count > 0U) {
+        g_gain_cur = g_safe_pool[0].gain;
+        memcpy(g_p_cur, g_safe_pool[0].p, sizeof(g_p_cur));
+    }
     g_blending = 0;
     g_blend_cnt = 0;
+    g_pending_pool_admit = 0U;
     sae_stat_rollbacks++;
 }
 
@@ -325,7 +445,7 @@ float balance_control(float x, float dx, float phi, float dphi, float target)
     } else if (g_k1_profile == K1_PROFILE_ADJUSTABLE) {
         effective_k1 = k1 + (7.2f - k1) * g_k1_adjust_ratio;
     }
-    float tau_lqr = -(effective_k1*e1 + k2*e2 + k3*e3 + k4*e4) + tau_ff;
+    float tau_feedback = -(effective_k1*e1 + k2*e2 + k3*e3 + k4*e4);
 
     // ---- 5.5 摩擦补偿：卡住给突破脉冲，动起来换动摩擦前馈 ----
     float ae1 = fabsf(e1);
@@ -339,7 +459,10 @@ float balance_control(float x, float dx, float phi, float dphi, float target)
     } else {
         tau_fric = TAU_COUL * tanhf(g.dphi_f / OMEGA_EPS);        // 动摩擦前馈（动才给，停归零）
     }
-    float tau = tau_lqr + Ki * g.xi + tau_fric;
+    float tau_raw = tau_feedback + tau_ff + Ki * g.xi + tau_fric;
+    float gain_scale = (fabsf(tau_raw) > 0.8f * TAU_MAX)
+                     ? RUNTIME_GAIN_SCALE : 1.0f;
+    float tau = gain_scale * tau_feedback + tau_ff + Ki * g.xi + tau_fric;
 
     // 6. 峰值限幅
     float tau_sat = clamp(tau, -TAU_MAX, TAU_MAX);
@@ -367,28 +490,30 @@ float balance_control(float x, float dx, float phi, float dphi, float target)
         g.xi *= 0.99f;        // 每拍泄 1%（1kHz 下 ~70ms 泄到一半）
     }
 
-    // 8. SAE：Lyapunov 屏障监控（切换期间）+ 滑窗触发检测
+    // 8. SAE: Lyapunov switching barrier plus periodic/state-norm triggers.
     if (g_blending) {
-        float V = e1*e1 + 0.1f*e2*e2 + 0.05f*e3*e3 + 0.01f*e4*e4;
-        if (V > BARRIER_V_MAX) {
+        float V = lyapunov_value(e1, e2, e3, e4);
+        if (V > 1.5f * g_v_ss) {
             gain_rollback();
-            return clamp(g_gain_cur.tau_ff, -TAU_MAX, TAU_MAX);  // 本拍保守输出
+            float tau_safe = -(g_gain_cur.k[0]*e1 + g_gain_cur.k[1]*e2
+                             + g_gain_cur.k[2]*e3 + g_gain_cur.k[3]*e4)
+                           + g_gain_cur.tau_ff + Ki*g.xi + tau_fric;
+            return clamp(tau_safe, -TAU_MAX, TAU_MAX);
         }
     }
-    if (g_traj_moving) {                 // 轨迹过渡段：误差是动态跟随误差，不属于稳态失配证据
-        g_err_acc = 0.0f;
-        g_err_cnt = 0;
-    } else {
-    g_err_acc += fabsf(e1);
-    if (++g_err_cnt >= ERR_WIN) {
-        if (g_err_acc / (float)ERR_WIN > ERR_TRIG && g_cooldown == 0U) {
-            sae_update_request = 1;              // 稳态偏置持续 → 置触发标志
-            g_cooldown = COOLDOWN_STEPS;
-            sae_stat_triggers++;
-        }
-        g_err_acc = 0.0f;
-        g_err_cnt = 0;
+    if (!g_blending && !g.sat && fabsf(e1) <= ERR_TRIG && fabsf(e2) < 0.02f) {
+        float Vss_sample = lyapunov_value(e1, e2, e3, e4);
+        g_v_ss = clamp((1.0f - VSS_ALPHA)*g_v_ss + VSS_ALPHA*Vss_sample,
+                       VSS_FLOOR, VSS_INITIAL);
     }
+    uint8_t periodic_due = (++g_periodic_steps >= UPDATE_PERIOD_STEPS);
+    if (periodic_due) g_periodic_steps = 0U;
+    float sensor_norm = sqrtf(e1*e1 + 0.1f*e2*e2
+                            + 0.05f*e3*e3 + 0.01f*e4*e4);
+    if ((periodic_due || sensor_norm > ERR_TRIG) && g_cooldown == 0U) {
+        sae_update_request = 1U;
+        g_cooldown = COOLDOWN_STEPS;
+        sae_stat_triggers++;
     }
     if (g_cooldown > 0U) g_cooldown--;
 
@@ -404,6 +529,18 @@ void balance_init(void)
     g.dx_f = 0.0f;
     g.dphi_f = 0.0f;
     g.sat = 0;
+    memset(g_p_old, 0, sizeof(g_p_old));
+    memcpy(g_p_old, g_p_cur, sizeof(g_p_cur));
+    memcpy(g_p_new, g_p_cur, sizeof(g_p_cur));
+    g_safe_pool_count = 0U;
+    (void)safe_pool_admit(&g_gain_cur, FACTORY_MODEL_FITNESS, g_p_cur);
+    g_v_ss = VSS_INITIAL;
+    g_periodic_steps = 0U;
+    g_pending_pool_admit = 0U;
+    g_new_pending = 0U;
+    g_blending = 0U;
+    g_blend_cnt = 0U;
+    g_cooldown = 0U;
 }
 
 // ============================================================================
@@ -592,34 +729,37 @@ void StartTask_2(void const *pvParameters)
             const uint32_t period = 2U * (TRAJ_HOLD_MS + TRAJ_TRANS_MS);   // 12 s
             uint32_t ph = HAL_GetTick() % period;
             float dir;
-            uint8_t moving = 1U;
             if (ph < TRAJ_HOLD_MS) {                                 dir = 1.0f;   // 停在 +50mm
-                moving = (ph < 800U) ? 1U : 0U; }                              // 进停留段前 0.8s 为过渡余振
+            }
             else if (ph < TRAJ_HOLD_MS + TRAJ_TRANS_MS) {                        // + → −
                 float s = (float)(ph - TRAJ_HOLD_MS) / (float)TRAJ_TRANS_MS;
                 dir = 1.0f - (1.0f - cosf(s * 3.14159265f));         // 余弦过渡 1→-1
             }
             else if (ph < 2U * TRAJ_HOLD_MS + TRAJ_TRANS_MS) {       dir = -1.0f;  // 停在 −50mm
-                moving = (ph < TRAJ_HOLD_MS + TRAJ_TRANS_MS + 800U) ? 1U : 0U; }
+            }
             else {                                                            // − → +
                 float s = (float)(ph - 2U * TRAJ_HOLD_MS - TRAJ_TRANS_MS) / (float)TRAJ_TRANS_MS;
                 dir = -1.0f + (1.0f - cosf(s * 3.14159265f));        // −1→+1
             }
             target = TRAJ_AMP * dir;
-            g_traj_moving = moving;
         }
 #endif
 
         // ==================== 2.5 SAE：待切换增益处理 ====================
         if (g_new_pending)
         {
-            g_new_pending = 0;
-            if (gain_sane(&g_gain_new))
+            g_new_pending = 0U;
+            if (!g_blending &&
+                gain_sane(&g_gain_new) &&
+                isfinite(g_gain_new_fitness) &&
+                matrix_spd4(g_p_new) &&
+                safe_pool_can_admit(g_gain_new_fitness))
             {
-                pool_push(&g_gain_cur);    // 现役增益入安全池（可回滚）
                 g_gain_old  = g_gain_cur;
-                g_blending  = 1;
-                g_blend_cnt = 0;
+                memcpy(g_p_old, g_p_cur, sizeof(g_p_cur));
+                g_blending  = 1U;
+                g_blend_cnt = 0U;
+                g_pending_pool_admit = 1U;
             }
             else
             {
@@ -628,9 +768,20 @@ void StartTask_2(void const *pvParameters)
         }
         if (g_blending && ++g_blend_cnt >= BLEND_STEPS)
         {
-            g_gain_cur = g_gain_new;       // 50ms 混合完成，新增益正式生效
-            g_blending = 0;
-            sae_stat_switches++;
+            if (g_pending_pool_admit &&
+                safe_pool_admit(&g_gain_new, g_gain_new_fitness, g_p_new))
+            {
+                g_gain_cur = g_gain_new;
+                memcpy(g_p_cur, g_p_new, sizeof(g_p_cur));
+                sae_stat_switches++;
+            }
+            else
+            {
+                sae_stat_rejected++;
+            }
+            g_pending_pool_admit = 0U;
+            g_blending = 0U;
+            g_blend_cnt = 0U;
         }
         if (sae_update_request)
         {
